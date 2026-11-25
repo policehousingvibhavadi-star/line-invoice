@@ -152,7 +152,8 @@ def admin(msg: str = "", _=Depends(auth)):
             o.append(f"<tr><td>{esc(r['room'])}</td><td>{esc(r['name'])}</td><td>{N(r['total'])}</td><td>{esc(r['remark'] or '')}</td>"
                      f"<td>{'ผูกแล้ว' if r['bound'] else '-'}</td><td>{'ชำระแล้ว' if paid else ('ส่งแล้ว' if r['sent_at'] else 'ยังไม่ส่ง')}</td><td>"
                      + (f"<form method=post action=/admin/unpay/{r['id']} onsubmit=\"return confirm('ย้อนสถานะเป็นยังไม่ชำระ?')\"><button>ย้อนสถานะ</button></form>" if paid
-                        else f"<form method=post action=/admin/paid/{r['id']}><button>รับชำระ+ส่งใบเสร็จ</button></form>") + "</td></tr>")
+                        else f"<form method=post action=/admin/send1/{r['id']} style=display:inline><button>{'ส่งซ้ำ' if r['sent_at'] else 'ส่งใบแจ้งหนี้'}</button></form> "
+                           f"<form method=post action=/admin/paid/{r['id']} style=display:inline><button>รับชำระ+ส่งใบเสร็จ</button></form>") + "</td></tr>")
         o.append("</table>")
     return page("".join(o))
 
@@ -187,8 +188,10 @@ def unpay(iid: int, _=Depends(auth)):
 
 @app.post("/admin/unbind/{bid}")
 def unbind(bid: int, _=Depends(auth)):
-    con = db(); con.execute("delete from bindings where id=?", (bid,)); con.commit()
-    return back("ยกเลิกการผูกแล้ว")
+    con = db(); b = con.execute("select * from bindings where id=?", (bid,)).fetchone()
+    if b: con.execute("update invoices set sent_at=null where site=? and room=? and status='unpaid'", (b["site"], b["room"]))
+    con.execute("delete from bindings where id=?", (bid,)); con.commit()
+    return back("ยกเลิกการผูกแล้ว (ห้องนี้จะถูกนับเป็นยังไม่ส่ง)")
 
 async def send_to_room(con, inv, msg):
     n = bad = 0
@@ -200,10 +203,18 @@ async def send_to_room(con, inv, msg):
 @app.post("/admin/send/{site}/{mk}")
 async def send(site: str, mk: int, _=Depends(auth)):
     con, ok, bad = db(), 0, 0
-    for inv in con.execute("select * from invoices where site=? and month_key=? and status='unpaid'", (site, mk)).fetchall():
+    for inv in con.execute("select * from invoices where site=? and month_key=? and status='unpaid' and sent_at is null", (site, mk)).fetchall():
         n, b = await send_to_room(con, inv, flex_invoice(inv)); ok += n; bad += b
         if n: con.execute("update invoices set sent_at=? where id=?", (today_th(), inv["id"]))
     con.commit(); return back(f"ส่งใบแจ้งหนี้ {ok} ข้อความ" + (f" ส่งไม่สำเร็จ {bad}" if bad else ""))
+
+@app.post("/admin/send1/{iid}")
+async def send1(iid: int, _=Depends(auth)):
+    con = db(); inv = con.execute("select * from invoices where id=?", (iid,)).fetchone()
+    n, bad = await send_to_room(con, inv, flex_invoice(inv))
+    if n: con.execute("update invoices set sent_at=? where id=?", (today_th(), iid)); con.commit()
+    if not n and not bad: return back(f"ห้อง {inv['room']} ยังไม่มีผู้ผูกไลน์ ไม่ได้ส่ง")
+    return back(f"ส่งใบแจ้งหนี้ห้อง {inv['room']} {n} ข้อความ" + (f" ส่งไม่สำเร็จ {bad}" if bad else ""))
 
 @app.post("/admin/paid/{iid}")
 async def paid(iid: int, _=Depends(auth)):
