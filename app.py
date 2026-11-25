@@ -132,6 +132,13 @@ def admin(msg: str = "", _=Depends(auth)):
             o.append(f"<tr><td>{esc(SITES[p['site']]['name'])}</td><td>ห้อง {esc(p['room'])}</td><td>"
                      f"<form method=post action=/admin/bind/{p['id']}><button name=ok value=1>ยืนยัน</button> <button name=ok value=0>ปฏิเสธ</button></form></td></tr>")
         o.append("</table>")
+    okb = con.execute("select * from bindings where status='ok' order by site, room").fetchall()
+    if okb:
+        o.append("<h3>ผู้ที่ผูกไลน์แล้ว</h3><table>")
+        for p in okb:
+            o.append(f"<tr><td>{esc(SITES[p['site']]['name'])}</td><td>ห้อง {esc(p['room'])}</td><td>"
+                     f"<form method=post action=/admin/unbind/{p['id']} onsubmit=\"return confirm('ยกเลิกการผูกไลน์ของห้องนี้?')\"><button>ยกเลิกการผูก</button></form></td></tr>")
+        o.append("</table>")
     for key, s in SITES.items():
         mk = con.execute("select max(month_key) k from invoices where site=?", (key,)).fetchone()["k"]
         if not mk: continue
@@ -144,7 +151,8 @@ def admin(msg: str = "", _=Depends(auth)):
             paid = r["status"] == "paid"
             o.append(f"<tr><td>{esc(r['room'])}</td><td>{esc(r['name'])}</td><td>{N(r['total'])}</td><td>{esc(r['remark'] or '')}</td>"
                      f"<td>{'ผูกแล้ว' if r['bound'] else '-'}</td><td>{'ชำระแล้ว' if paid else ('ส่งแล้ว' if r['sent_at'] else 'ยังไม่ส่ง')}</td><td>"
-                     + ("" if paid else f"<form method=post action=/admin/paid/{r['id']}><button>รับชำระ+ส่งใบเสร็จ</button></form>") + "</td></tr>")
+                     + (f"<form method=post action=/admin/unpay/{r['id']} onsubmit=\"return confirm('ย้อนสถานะเป็นยังไม่ชำระ?')\"><button>ย้อนสถานะ</button></form>" if paid
+                        else f"<form method=post action=/admin/paid/{r['id']}><button>รับชำระ+ส่งใบเสร็จ</button></form>") + "</td></tr>")
         o.append("</table>")
     return page("".join(o))
 
@@ -171,6 +179,16 @@ def bind(bid: int, ok: int = Form(...), _=Depends(auth)):
     con = db()
     con.execute("update bindings set status='ok' where id=?", (bid,)) if ok else con.execute("delete from bindings where id=?", (bid,))
     con.commit(); return back("บันทึกแล้ว")
+
+@app.post("/admin/unpay/{iid}")
+def unpay(iid: int, _=Depends(auth)):
+    con = db(); con.execute("update invoices set status='unpaid', paid_at=null where id=?", (iid,)); con.commit()
+    return back("ย้อนสถานะเป็นยังไม่ชำระแล้ว (ไม่มีข้อความส่งออก)")
+
+@app.post("/admin/unbind/{bid}")
+def unbind(bid: int, _=Depends(auth)):
+    con = db(); con.execute("delete from bindings where id=?", (bid,)); con.commit()
+    return back("ยกเลิกการผูกแล้ว")
 
 async def send_to_room(con, inv, msg):
     n = bad = 0
