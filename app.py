@@ -5,7 +5,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 import httpx
 from fastapi import FastAPI, Request, UploadFile, File, Form, Depends, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse, FileResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from parse_report import parse
 
@@ -20,6 +20,7 @@ ACC_NO = os.getenv("BANK_ACCOUNT_NO", "")
 BANK = os.getenv("BANK_NAME", "ธนาคารกรุงไทย")
 MONTHS = ["มกราคม","กุมภาพันธ์","มีนาคม","เมษายน","พฤษภาคม","มิถุนายน","กรกฎาคม","สิงหาคม","กันยายน","ตุลาคม","พฤศจิกายน","ธันวาคม"]
 DB = os.path.join(os.getenv("DATA_DIR", "."), "app.db")
+SLIP_DIR = os.path.join(os.getenv("DATA_DIR", "."), "slips")
 app = FastAPI()
 basic = HTTPBasic()
 
@@ -29,7 +30,9 @@ def db():
       room text, name text, usage int, fee real, water real, elec real, total real, remark text,
       status text default 'unpaid', sent_at text, paid_at text, unique(site, month_key, room));
       create table if not exists bindings(id integer primary key, site text, user_id text, room text,
-      status text default 'pending', unique(site, user_id));""")
+      status text default 'pending', unique(site, user_id));
+      create table if not exists slips(id integer primary key, site text, room text, user_id text, file text, sha text,
+      dup int default 0, invoice_id int, status text default 'pending', created_at text);""")
     return c
 
 def auth(cr: HTTPBasicCredentials = Depends(basic)):
@@ -78,6 +81,10 @@ async def line(site, path, body):
         r = await c.post("https://api.line.me/v2/bot/message/" + path, json=body,
                          headers={"Authorization": "Bearer " + SITES[site]["token"]})
         r.raise_for_status()
+async def fetch_content(site, mid):
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.get(f"https://api-data.line.me/v2/bot/message/{mid}/content", headers={"Authorization": "Bearer " + SITES[site]["token"]})
+        r.raise_for_status(); return r.content
 async def push(site, uid, msgs): await line(site, "push", {"to": uid, "messages": msgs})
 async def reply(site, tok, msgs): await line(site, "reply", {"replyToken": tok, "messages": msgs})
 T = lambda s: {"type": "text", "text": s}
@@ -95,6 +102,22 @@ async def webhook(site: str, req: Request):
         if not uid or not tok: continue
         if ev["type"] == "follow":
             await reply(site, tok, [T("สวัสดีครับ พิมพ์เลขที่ห้องของท่าน เช่น 1/002 เพื่อลงทะเบียนรับใบแจ้งหนี้")]); continue
+        if ev["type"] == "message" and ev["message"].get("type") == "image":      # สลิปโอนเงิน
+            b = con.execute("select * from bindings where site=? and user_id=? and status='ok'", (site, uid)).fetchone()
+            if not b:
+                await reply(site, tok, [T("ยังไม่ได้ลงทะเบียนเลขห้อง กรุณาพิมพ์เลขห้อง (เช่น 1/002) ก่อน แล้วส่งสลิปอีกครั้ง")]); continue
+            try: data = await fetch_content(site, ev["message"]["id"])
+            except httpx.HTTPError:
+                await reply(site, tok, [T("รับรูปไม่สำเร็จ กรุณาส่งสลิปอีกครั้ง")]); continue
+            sha = hashlib.sha256(data).hexdigest()
+            dup = con.execute("select 1 from slips where sha=?", (sha,)).fetchone() is not None
+            os.makedirs(SLIP_DIR, exist_ok=True)
+            fn = f"{site}_{ev['message']['id']}.jpg"
+            with open(os.path.join(SLIP_DIR, fn), "wb") as f: f.write(data)
+            inv = con.execute("select id from invoices where site=? and room=? and status='unpaid' order by month_key desc limit 1", (site, b["room"])).fetchone()
+            con.execute("insert into slips(site,room,user_id,file,sha,dup,invoice_id,created_at) values(?,?,?,?,?,?,?,?)",
+                        (site, b["room"], uid, fn, sha, int(dup), inv["id"] if inv else None, today_th())); con.commit()
+            await reply(site, tok, [T("ได้รับสลิปแล้ว รอเจ้าหน้าที่ตรวจสอบและส่งใบเสร็จให้ครับ")]); continue
         if ev["type"] != "message" or ev["message"].get("type") != "text": continue
         txt = ev["message"]["text"].strip()
         m = re.search(r"(\d{1,2})\s*/\s*(\d{1,3})", txt)
@@ -132,6 +155,17 @@ def admin(msg: str = "", _=Depends(auth)):
             o.append(f"<tr><td>{esc(SITES[p['site']]['name'])}</td><td>ห้อง {esc(p['room'])}</td><td>"
                      f"<form method=post action=/admin/bind/{p['id']}><button name=ok value=1>ยืนยัน</button> <button name=ok value=0>ปฏิเสธ</button></form></td></tr>")
         o.append("</table>")
+    sl = con.execute("select s.*, i.total, i.month, i.name from slips s left join invoices i on i.id=s.invoice_id where s.status='pending' order by s.id").fetchall()
+    if sl:
+        o.append("<h3>สลิปรอตรวจ</h3><p class=w>เทียบยอดกับเงินที่เข้าบัญชีจริงก่อนกดยืนยัน โปรแกรมยังไม่ได้อ่านยอดจากรูปสลิป</p>")
+        for p in sl:
+            info = (f"ยอดที่ต้องชำระ <b>{N(p['total'])}</b> บาท งวด{esc(p['month'])}" if p["invoice_id"] else "<span class=w>ไม่พบยอดค้างชำระของห้องนี้</span>")
+            o.append(f"<div style='border:1px solid #ddd;padding:8px;margin:6px 0;display:flex;gap:12px;flex-wrap:wrap'>"
+                     f"<a href=/admin/slip/{p['id']}/img target=_blank><img src=/admin/slip/{p['id']}/img style='width:130px'></a><div>"
+                     f"{esc(SITES[p['site']]['name'])} ห้อง {esc(p['room'])} {esc(p['name'] or '')}<br>{info}<br>ส่งเมื่อ {esc(p['created_at'])}"
+                     + ("<br><b class=w>รูปสลิปนี้เคยถูกส่งมาแล้ว ตรวจให้ดี</b>" if p["dup"] else "") + "<br>"
+                     + (f"<form method=post action=/admin/slip/{p['id']}/ok style=display:inline><button>ยืนยันรับชำระ+ส่งใบเสร็จ</button></form> " if p["invoice_id"] else "")
+                     + f"<form method=post action=/admin/slip/{p['id']}/no style=display:inline><button>ปฏิเสธ</button></form></div></div>")
     okb = con.execute("select * from bindings where status='ok' order by site, room").fetchall()
     if okb:
         o.append("<h3>ผู้ที่ผูกไลน์แล้ว</h3><table>")
@@ -216,12 +250,38 @@ async def send1(iid: int, _=Depends(auth)):
     if not n and not bad: return back(f"ห้อง {inv['room']} ยังไม่มีผู้ผูกไลน์ ไม่ได้ส่ง")
     return back(f"ส่งใบแจ้งหนี้ห้อง {inv['room']} {n} ข้อความ" + (f" ส่งไม่สำเร็จ {bad}" if bad else ""))
 
-@app.post("/admin/paid/{iid}")
-async def paid(iid: int, _=Depends(auth)):
-    con = db(); inv = con.execute("select * from invoices where id=?", (iid,)).fetchone()
+async def do_paid(con, iid):
+    inv = con.execute("select * from invoices where id=?", (iid,)).fetchone()
+    if inv["status"] == "paid": return f"ห้อง {inv['room']} ชำระแล้ว ไม่ได้ส่งใบเสร็จซ้ำ"
     con.execute("update invoices set status='paid', paid_at=? where id=?", (today_th(), iid)); con.commit()
     n, bad = await send_to_room(con, inv, flex_receipt(inv))
-    return back(f"บันทึกรับชำระห้อง {inv['room']} ส่งใบเสร็จ {n} ข้อความ" + (f" ส่งไม่สำเร็จ {bad}" if bad else ""))
+    return f"บันทึกรับชำระห้อง {inv['room']} ส่งใบเสร็จ {n} ข้อความ" + (f" ส่งไม่สำเร็จ {bad}" if bad else "")
+
+@app.post("/admin/paid/{iid}")
+async def paid(iid: int, _=Depends(auth)):
+    return back(await do_paid(db(), iid))
+
+@app.get("/admin/slip/{sid}/img")
+def slip_img(sid: int, _=Depends(auth)):
+    s = db().execute("select file from slips where id=?", (sid,)).fetchone()
+    if not s: raise HTTPException(404)
+    return FileResponse(os.path.join(SLIP_DIR, s["file"]), media_type="image/jpeg")
+
+@app.post("/admin/slip/{sid}/ok")
+async def slip_ok(sid: int, _=Depends(auth)):
+    con = db(); s = con.execute("select * from slips where id=?", (sid,)).fetchone()
+    if not s or not s["invoice_id"]: return back("ไม่พบยอดค้างชำระของสลิปนี้")
+    msg = await do_paid(con, s["invoice_id"])
+    con.execute("update slips set status='approved' where id=?", (sid,)); con.commit(); return back(msg)
+
+@app.post("/admin/slip/{sid}/no")
+async def slip_no(sid: int, _=Depends(auth)):
+    con = db(); s = con.execute("select * from slips where id=?", (sid,)).fetchone()
+    if not s: return back("ไม่พบสลิป")
+    con.execute("update slips set status='rejected' where id=?", (sid,)); con.commit()
+    try: await push(s["site"], s["user_id"], [T("เจ้าหน้าที่ตรวจสลิปแล้วยังไม่ถูกต้อง กรุณาตรวจสอบและส่งสลิปใหม่ หรือติดต่อเจ้าหน้าที่ครับ")]); note = "แจ้งผู้ส่งแล้ว"
+    except httpx.HTTPError: note = "แจ้งผู้ส่งไม่สำเร็จ"
+    return back("ปฏิเสธสลิปแล้ว " + note)
 
 @app.get("/")
 def root(): return PlainTextResponse("ok")
